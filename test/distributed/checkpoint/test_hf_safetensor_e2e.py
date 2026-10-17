@@ -3,10 +3,13 @@
 import importlib
 import json
 import os
+from unittest.mock import MagicMock
 
 import torch
 import torch.distributed.checkpoint as dist_cp
 from torch import distributed as dist
+from torch.distributed.checkpoint.metadata import MetadataIndex
+from torch.distributed.checkpoint.planner import LoadItemType, ReadItem
 from torch.distributed.checkpoint.quantized_hf_storage import (
     QuantizedHuggingFaceStorageReader,
 )
@@ -274,6 +277,100 @@ class TestSingleRankSaveLoad(TestCase):
                 atol=1e-5,
                 msg=f"Value mismatch for tensor {tensor_name}",
             )
+
+    @with_temp_dir
+    def test_compressed_tensors_mxfp4_loading(self) -> None:
+        """Dequantize compressed-tensors MXFP4 weight_packed using weight_scale."""
+        try:
+            from safetensors import safe_open
+            from safetensors.torch import save_file
+        except ImportError:
+            print("safetensors not installed")
+            return
+
+        CHECKPOINT_DIR = self.temp_dir
+        fp4_values = torch.tensor(
+            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+            + [-0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+        )
+
+        # Two values per byte, low nibble first; one E8M0 scale per 32 values.
+        rows, cols = 4, 96
+        prefix = "model.layers.1.block_sparse_moe.experts.0"
+        packed = torch.randint(0, 256, (rows, cols // 2), dtype=torch.uint8)
+        scale = torch.randint(120, 135, (rows, cols // 32), dtype=torch.uint8)
+        codes = torch.stack([packed & 0x0F, packed >> 4], dim=-1).reshape(rows, cols)
+        exponents = scale.repeat_interleave(32, dim=1).to(torch.float32) - 127
+        expected = fp4_values[codes.long()] * torch.pow(2.0, exponents)
+        unquantized = torch.randn(rows, cols)
+
+        # The scale lives in a different file than the packed weight.
+        files = {
+            "model-00001-of-00002.safetensors": {
+                f"{prefix}.w1.weight_packed": packed,
+                "model.layers.1.mlp_res_proj.weight": unquantized,
+            },
+            "model-00002-of-00002.safetensors": {f"{prefix}.w1.weight_scale": scale},
+        }
+        weight_map = {}
+        for file_name, tensors in files.items():
+            save_file(tensors, os.path.join(CHECKPOINT_DIR, file_name))
+            weight_map.update(dict.fromkeys(tensors, file_name))
+        with open(os.path.join(CHECKPOINT_DIR, "model.safetensors.index.json"), "w") as f:
+            json.dump({"weight_map": weight_map}, f)
+
+        state_dict_to_load = {
+            f"{prefix}.w1.weight_packed": torch.zeros(rows, cols),
+            "model.layers.1.mlp_res_proj.weight": torch.zeros(rows, cols),
+        }
+        reader = QuantizedHuggingFaceStorageReader(path=CHECKPOINT_DIR)
+        dist_cp.load(state_dict=state_dict_to_load, storage_reader=reader)
+
+        torch.testing.assert_close(
+            state_dict_to_load[f"{prefix}.w1.weight_packed"], expected
+        )
+        torch.testing.assert_close(
+            state_dict_to_load["model.layers.1.mlp_res_proj.weight"], unquantized
+        )
+
+        # A shard that starts and ends mid-group: rows 1:3, cols 40:90.
+        read_item = ReadItem(
+            type=LoadItemType.TENSOR,
+            storage_index=MetadataIndex(fqn=f"{prefix}.w1.weight_packed", offset=[0, 0]),
+            dest_index=MetadataIndex(fqn=f"{prefix}.w1.weight_packed", offset=[0, 0]),
+            storage_offsets=[1, 40],
+            dest_offsets=[0, 0],
+            lengths=[2, 50],
+        )
+        planner = MagicMock()
+        planner.resolve_tensor.return_value = torch.zeros(2, 50)
+        file_name = os.path.join(CHECKPOINT_DIR, "model-00001-of-00002.safetensors")
+        with safe_open(file_name, framework="pt") as f:
+            reader._process_read_request(f, read_item, planner)
+        torch.testing.assert_close(
+            planner.commit_tensor.call_args[0][1], expected[1:3, 40:90]
+        )
+
+        # NVFP4 uses the same names with one scale per 16 values; reject it.
+        save_file(
+            {f"{prefix}.w1.weight_scale": torch.zeros(rows, cols // 16, dtype=torch.uint8)},
+            os.path.join(CHECKPOINT_DIR, "model-00002-of-00002.safetensors"),
+        )
+        with self.assertRaisesRegex(ValueError, "one MXFP4 scale per 32 values"):
+            QuantizedHuggingFaceStorageReader(path=CHECKPOINT_DIR).read_metadata()
+
+        # int4 pack-quantized also uses these names: int32 [out, in/8] and a float
+        # scale per group of 128, which passes the MXFP4 shape check; reject it.
+        save_file(
+            {f"{prefix}.w1.weight_packed": torch.zeros(rows, 256 // 8, dtype=torch.int32)},
+            os.path.join(CHECKPOINT_DIR, "model-00001-of-00002.safetensors"),
+        )
+        save_file(
+            {f"{prefix}.w1.weight_scale": torch.ones(rows, 256 // 128, dtype=torch.bfloat16)},
+            os.path.join(CHECKPOINT_DIR, "model-00002-of-00002.safetensors"),
+        )
+        with self.assertRaisesRegex(ValueError, "expected uint8"):
+            QuantizedHuggingFaceStorageReader(path=CHECKPOINT_DIR).read_metadata()
 
 
 class TestDistributedHFSafetensorsConsolidation(DTensorTestBase):
